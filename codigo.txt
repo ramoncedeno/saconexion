@@ -1,0 +1,1312 @@
+
+Codigo: https://script.google.com/macros/s/
+
+// =========================================================================
+//  SERVIR HTML
+// =========================================================================
+function doGet(e) {
+  const params = e.parameter;
+  let template;
+  if (params.v === 'Monitor') {
+     template = HtmlService.createTemplateFromFile('Monitor');
+  } else {
+     template = HtmlService.createTemplateFromFile('Index');
+  }
+  template.url = ScriptApp.getService().getUrl();
+  return template.evaluate()
+      .setTitle('Sistema de Asistencia')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// =========================================================================
+//  INICIALIZACIÓN DE BD
+// =========================================================================
+function configurarBaseDeDatos() {
+  const ss = SpreadsheetApp.openById(ID_SHEET);
+  const headers = {
+    "Usuarios": ["Usuario", "Contraseña", "Nombres", "Apellidos", "FilialDefecto", "Rol", "Email"],
+    "Filiales": ["Codigo", "ZonaHoraria"],
+    "Registros": ["Fecha Hora", "Usuario", "Nombre", "Extensión", "Actividad", "Filial", "Duración", "Rol"]
+  };
+  Object.keys(headers).forEach(name => {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) sheet = ss.insertSheet(name);
+    if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, headers[name].length).setValues([headers[name]]).setFontWeight("bold");
+  });
+
+  // Limpieza total (Caché RAM + Búnker Disco)
+  CacheService.getScriptCache().removeAll(["DIRECTORIO_USUARIOS", "LISTA_ACTIVOS"]);
+  // Nota: No borramos PropertiesService completo por seguridad, se limpian individualmente al salir.
+}
+
+// =========================================================================
+//  LOGIN
+// =========================================================================
+function loginUsuario(usuarioInput, passwordInput, rolSeleccionado) {
+  if (!usuarioInput || !passwordInput) return { error: true, msg: "Faltan datos." };
+
+  const directorio = obtenerDirectorioUsuarios();
+  const uInput = String(usuarioInput).trim().toLowerCase();
+  const pInput = String(passwordInput).trim();
+
+  const usuarioEncontrado = directorio.find(u => u.usuario === uInput && u.password === pInput);
+
+  if (!usuarioEncontrado) return { error: true, msg: "Credenciales incorrectas" };
+
+  const rolRealBD = usuarioEncontrado.rol || 'Asesor SAC';
+
+  if (String(rolSeleccionado).toUpperCase() !== String(rolRealBD).toUpperCase()) {
+    return { error: true, msg: "Rol incorrecto. Usted está registrado como: " + rolRealBD };
+  }
+
+  const ss = SpreadsheetApp.openById(ID_SHEET);
+  let listaFiliales = [];
+  const sheetFiliales = ss.getSheetByName("Filiales");
+  if (sheetFiliales && sheetFiliales.getLastRow() > 1) {
+      const dataFiliales = sheetFiliales.getDataRange().getValues();
+      listaFiliales = dataFiliales.slice(1).map(r => r[0]).filter(Boolean);
+  }
+
+  return {
+    error: false,
+    usuario: usuarioEncontrado.usuario,
+    nombres: usuarioEncontrado.nombres,
+    apellidos: usuarioEncontrado.apellidos,
+    filialDefecto: usuarioEncontrado.filialDefecto,
+    rol: rolRealBD,
+    listaFiliales: listaFiliales,
+    filial: usuarioEncontrado.filialDefecto,
+    extension: ""
+  };
+}
+
+// =========================================================================
+//  MOTOR PRINCIPAL: REGISTRO DE EVENTOS (OPTIMIZADO + BÚNKER)
+// =========================================================================
+function registrarEvento(datos) {
+  const lock = LockService.getScriptLock();
+  try { lock.waitLock(5000); } catch (e) { return { error: true, msg: "Sistema ocupado." }; }
+
+  try {
+    const cache = CacheService.getScriptCache();
+    const key = "estado_" + datos.usuario;
+    const ahora = new Date();
+
+    const ss = SpreadsheetApp.openById(ID_SHEET);
+    const sheet = ss.getSheetByName("Registros");
+
+    // Intentamos leer del Caché primero, si falla, leemos del Búnker
+    let estadoAnteriorJson = cache.get(key);
+    if (!estadoAnteriorJson) {
+       estadoAnteriorJson = PropertiesService.getScriptProperties().getProperty(key);
+    }
+
+    // 1. GESTIÓN DEL CIERRE DEL ESTADO ANTERIOR
+    if (estadoAnteriorJson) {
+      const estadoAnterior = JSON.parse(estadoAnteriorJson);
+      const inicio = new Date(estadoAnterior.timestamp);
+      const duracionStr = calcularDuracion(inicio, ahora);
+
+      sheet.appendRow([
+        inicio, estadoAnterior.usuario, estadoAnterior.nombre, estadoAnterior.extension,
+        estadoAnterior.estado, estadoAnterior.filial, duracionStr, estadoAnterior.rol
+      ]);
+    } else {
+      // Caso Zombie: Si no hay datos previos y no es Login, registramos advertencia pero no fallamos
+      if (datos.estado !== 'LOGIN') {
+         // Opcional: sheet.appendRow([ahora, datos.usuario, "RECUPERADO", datos.extension, "ERROR CACHE", datos.filial, "--", datos.rol]);
+      }
+    }
+
+    // 2. GESTIÓN DEL NUEVO ESTADO
+    if (datos.estado === 'DESCONECTADO') {
+      // LOGOUT
+      sheet.appendRow([
+        ahora, datos.usuario, datos.nombres + " " + datos.apellidos,
+        datos.extension, "DESCONECTADO", datos.filial, "00:00:00", datos.rol
+      ]);
+
+      cache.remove(key);
+      borrarRespaldoUsuario(datos.usuario); // Limpiar Búnker
+      actualizarListaActivos(datos.usuario, 'REMOVE'); // Sacar de Lista VIP
+
+    } else {
+      // LOGIN O CAMBIO DE ESTADO
+      const nuevoEstadoObj = {
+        estado: datos.estado, timestamp: ahora.getTime(), usuario: datos.usuario,
+        nombre: datos.nombres + " " + datos.apellidos, extension: datos.extension,
+        rol: datos.rol, filial: datos.filial
+      };
+
+      // A. Guardar en Caché (Rápido, 6 horas)
+      cache.put(key, JSON.stringify(nuevoEstadoObj), CACHE_TIEMPO_LIMITE);
+
+      // B. Guardar en Búnker (Lento, Permanente)
+      respaldarEstadoUsuario(datos.usuario, nuevoEstadoObj);
+
+      // C. Actualizar Índice
+      if (datos.estado === 'LOGIN') {
+         actualizarListaActivos(datos.usuario, 'ADD');
+      }
+    }
+
+    return { success: true, estado: datos.estado };
+  } catch (error) {
+    return { error: true, msg: error.toString() };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// =========================================================================
+//  MONITOR: LECTURA ULTRA-RÁPIDA (SOLO LISTA DE ACTIVOS)
+// =========================================================================
+function obtenerDashboardSupervisor() {
+  const cache = CacheService.getScriptCache();
+
+  // 1. Recuperamos la "Lista VIP" (solo los IDs de quienes están online)
+  const listaActivosJson = cache.get("LISTA_ACTIVOS");
+  let usuariosActivos = [];
+
+  if (listaActivosJson) {
+     usuariosActivos = JSON.parse(listaActivosJson);
+  } else {
+     // Fallback: Si se borró la lista VIP del caché, intentar reconstruirla del Búnker es complejo.
+     // En este caso raro, el monitor aparecerá vacío hasta que alguien interactúe o se fuerce sync.
+     return [];
+  }
+
+  let listaFinal = [];
+
+  // 2. Iteramos SOLO sobre los activos
+  for (let usuarioId of usuariosActivos) {
+    const key = "estado_" + usuarioId;
+    let estadoJson = cache.get(key);
+
+    // Si no está en caché rápido, intentamos leer del Búnker silenciosamente
+    if (!estadoJson) {
+       estadoJson = PropertiesService.getScriptProperties().getProperty(key);
+       // Si lo encontramos en el búnker, lo revivimos en caché para la próxima
+       if (estadoJson) cache.put(key, estadoJson, CACHE_TIEMPO_LIMITE);
+    }
+
+    if (estadoJson) {
+      const data = JSON.parse(estadoJson);
+      listaFinal.push({
+        nombre: data.nombre, extension: data.extension, estado: data.estado,
+        filial: data.filial, rol: data.rol, timestamp: data.timestamp
+      });
+    }
+  }
+
+  listaFinal.sort((a, b) => a.filial.localeCompare(b.filial) || a.rol.localeCompare(b.rol) || a.nombre.localeCompare(b.nombre));
+  return listaFinal;
+}
+
+// =========================================================================
+//  SISTEMA DE LATIDOS (HEARTBEAT) - RENOVACIÓN DE SESIÓN
+// =========================================================================
+function enviarLatido(usuario) {
+  const cache = CacheService.getScriptCache();
+  const key = "estado_" + usuario;
+  let dataJson = cache.get(key);
+
+  // Si NO está en caché (peligro), intentamos restaurar del Búnker
+  if (!dataJson) {
+     const dataBunker = PropertiesService.getScriptProperties().getProperty(key);
+     if (dataBunker) {
+       dataJson = dataBunker;
+       cache.put(key, dataJson, CACHE_TIEMPO_LIMITE); // Revivir en RAM
+       actualizarListaActivos(usuario, 'ADD'); // Asegurar en lista
+       return { status: "RESTORED" };
+     } else {
+       return { status: "LOST" }; // Se perdió totalmente
+     }
+  }
+
+  // Si está en caché, simplemente lo volvemos a guardar para reiniciar el contador de 6 horas
+  cache.put(key, dataJson, CACHE_TIEMPO_LIMITE);
+  actualizarListaActivos(usuario, 'REFRESH'); // Mantener viva la lista
+
+  return { status: "OK" };
+}
+
+// =========================================================================
+//  GESTIÓN DE LISTAS Y BÚNKER (HELPERS)
+// =========================================================================
+
+function actualizarListaActivos(usuario, accion) {
+  const cache = CacheService.getScriptCache();
+  let lista = [];
+  const raw = cache.get("LISTA_ACTIVOS");
+  if (raw) lista = JSON.parse(raw);
+
+  const existe = lista.includes(usuario);
+
+  if (accion === 'ADD' && !existe) {
+    lista.push(usuario);
+  } else if (accion === 'REMOVE' && existe) {
+    lista = lista.filter(u => u !== usuario);
+  }
+  // Guardamos y renovamos tiempo
+  cache.put("LISTA_ACTIVOS", JSON.stringify(lista), CACHE_TIEMPO_LIMITE);
+}
+
+function respaldarEstadoUsuario(usuario, datosObj) {
+  const key = "estado_" + usuario;
+  // PropertiesService es persistente, no se borra a las 6h
+  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(datosObj));
+}
+
+function borrarRespaldoUsuario(usuario) {
+  const key = "estado_" + usuario;
+  PropertiesService.getScriptProperties().deleteProperty(key);
+}
+
+// =========================================================================
+//  SINCRONIZACIÓN MANUAL
+// =========================================================================
+function forzarActualizacionCache() {
+  CacheService.getScriptCache().remove("DIRECTORIO_USUARIOS");
+  return { error: false, msg: "Base de datos sincronizada correctamente." };
+}
+
+// =========================================================================
+//  CIERRE NOCTURNO
+// =========================================================================
+function cierreAutomaticoNocturno() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return;
+  try {
+    const cache = CacheService.getScriptCache();
+    // 1. Usamos la lista de activos para saber a quién cerrar
+    const listaActivosJson = cache.get("LISTA_ACTIVOS");
+    if (!listaActivosJson) return;
+
+    const usuariosActivos = JSON.parse(listaActivosJson);
+    const ss = SpreadsheetApp.openById(ID_SHEET);
+    const sheetLog = ss.getSheetByName("Registros");
+    const fechaCierre = new Date();
+    let contador = 0;
+
+    for (let usuario of usuariosActivos) {
+      const key = "estado_" + usuario;
+      // Intentamos leer de caché o búnker
+      let estadoAnteriorJson = cache.get(key);
+      if (!estadoAnteriorJson) {
+         estadoAnteriorJson = PropertiesService.getScriptProperties().getProperty(key);
+      }
+
+      if (estadoAnteriorJson) {
+        const estadoAnterior = JSON.parse(estadoAnteriorJson);
+        const inicio = new Date(estadoAnterior.timestamp);
+        const duracionStr = calcularDuracion(inicio, fechaCierre);
+
+        sheetLog.appendRow([
+          inicio, estadoAnterior.usuario, estadoAnterior.nombre, estadoAnterior.extension,
+          estadoAnterior.estado + " (Cierre Auto)", estadoAnterior.filial, duracionStr, estadoAnterior.rol
+        ]);
+
+        // Limpieza individual
+        cache.remove(key);
+        borrarRespaldoUsuario(usuario);
+        contador++;
+      }
+    }
+
+    // Limpieza de lista maestra
+    cache.remove("LISTA_ACTIVOS");
+    console.log("Cierre nocturno completado. Sesiones cerradas: " + contador);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// =========================================================================
+//  HELPERS GENERALES
+// =========================================================================
+function calcularDuracion(inicio, fin) {
+  const diff = fin - inicio;
+  const diffHrs = Math.floor((diff % 86400000) / 3600000);
+  const diffMins = Math.floor(((diff % 86400000) % 3600000) / 60000);
+  const diffSecs = Math.floor((diff % 60000) / 1000);
+  return (diffHrs < 10 ? "0"+diffHrs : diffHrs) + ":" +
+         (diffMins < 10 ? "0"+diffMins : diffMins) + ":" +
+         (diffSecs < 10 ? "0"+diffSecs : diffSecs);
+}
+
+function obtenerDirectorioUsuarios() {
+  const cache = CacheService.getScriptCache();
+  const cachedData = cache.get("DIRECTORIO_USUARIOS");
+  if (cachedData) return JSON.parse(cachedData);
+
+  const ss = SpreadsheetApp.openById(ID_SHEET);
+  const sheetUsers = ss.getSheetByName("Usuarios");
+  const data = sheetUsers.getDataRange().getValues();
+
+  let usuarios = [];
+  for (let i = 1; i < data.length; i++) {
+    if(data[i][0]) {
+      usuarios.push({
+        usuario: String(data[i][0]).trim().toLowerCase(),
+        password: String(data[i][1]).trim(),
+        nombres: data[i][2],
+        apellidos: data[i][3],
+        filialDefecto: data[i][4],
+        rol: data[i][5],
+        email: data[i][6]
+      });
+    }
+  }
+  cache.put("DIRECTORIO_USUARIOS", JSON.stringify(usuarios), CACHE_TIEMPO_LIMITE);
+  return usuarios;
+}
+
+Vista #1: Index.html
+
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <style>
+      body { font-family: 'Roboto', sans-serif; background-color: #eceff1; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+      .card { background: white; padding: 2.5rem; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); width: 350px; text-align: center; transition: all 0.3s ease; }
+
+      h2 { color: #37474f; margin-bottom: 20px; font-size: 22px; }
+      input, select { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #cfd8dc; border-radius: 6px; box-sizing: border-box; font-size: 16px; background: #fff; }
+
+      #login-role { border: 2px solid #0288d1; color: #0277bd; font-weight: bold; }
+
+      button { width: 100%; padding: 12px; margin-top: 10px; border: none; border-radius: 6px; font-size: 16px; font-weight: 500; cursor: pointer; transition: 0.2s; }
+      .btn-primary { background-color: #0288d1; color: white; }
+      .btn-primary:disabled { background-color: #b0bec5; cursor: not-allowed; }
+
+      .btn-sync {
+        background-color: transparent;
+        color: #78909c;
+        border: 1px solid #cfd8dc;
+        font-size: 13px;
+        margin-top: 15px;
+        display: none;
+      }
+      .btn-sync:hover { background-color: #eceff1; color: #37474f; }
+
+      .btn-main { width: 100%; margin: 10px 0; padding: 15px; font-weight: bold; font-size: 18px; color: white; }
+      .btn-online { background-color: #43a047; }
+      .btn-pausa { background-color: #e53935; }
+
+      .btn-online:disabled { background-color: #81c784; opacity: 0.7; cursor: default; }
+
+      /* NUEVO: Animación de parpadeo */
+      @keyframes blink-animation {
+        0% { background-color: #43a047; opacity: 1; }
+        50% { background-color: #1b5e20; opacity: 0.7; }
+        100% { background-color: #43a047; opacity: 1; }
+      }
+      .btn-confirm-blink {
+        animation: blink-animation 1s infinite;
+        font-size: 14px !important; /* Texto un poco más pequeño para que quepa la frase larga */
+      }
+
+      .btn-sub-pausa { background-color: #ef5350; color: white; margin-top: 5px; font-size: 14px; }
+      .btn-sub-pausa:hover { background-color: #d32f2f; }
+      .btn-cancelar { background-color: #90a4ae; color: white; }
+
+      .btn-monitor-link {
+        background-color: #ff9800; color: white; font-weight: bold; margin-top: 15px; font-size: 14px; display: block;
+      }
+      .btn-monitor-link:hover { background-color: #f57c00; }
+
+      button:disabled { opacity: 0.6; cursor: wait; }
+      .hidden { display: none; }
+      .info-box { background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: left; font-size: 14px; color: #455a64; }
+      .info-box span { display: block; font-weight: bold; color: #0277bd; }
+
+      .time-container { margin-top: 15px; padding-top: 10px; border-top: 1px solid #bbdefb; text-align: center; }
+      #status-since { font-size: 13px; color: #78909c; margin-bottom: 2px; font-weight: normal; }
+      #status-chronometer { font-size: 28px; font-weight: 700; color: #37474f; font-family: 'Roboto', monospace; letter-spacing: 1px; }
+
+      .error { color: red; font-size: 12px; margin-top: 5px; min-height: 18px; }
+      #menu-pausas { background: #ffebee; padding: 15px; border-radius: 8px; border: 1px solid #ffcdd2; animation: fadeIn 0.3s; }
+      @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+
+      #initial-loader { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #eceff1; z-index: 9999; display: flex; justify-content: center; align-items: center; color: #546e7a; font-weight: bold;}
+    </style>
+  </head>
+  <body>
+
+    <div id="initial-loader">Cargando sistema...</div>
+
+    <div id="view-login" class="card hidden">
+      <h2>Inicia tú conexión</h2>
+
+      <label style="display:block; text-align:left; font-size:12px; color:#666; margin-bottom:4px;">Soy:</label>
+      <select id="login-role">
+        <option value="Asesor SAC">Asesor SAC</option>
+        <option value="Torre de Control">Torre de Control</option>
+      </select>
+
+      <input type="text" id="login-user" placeholder="Usuario asignado">
+      <input type="password" id="login-pass" placeholder="Contraseña">
+      <div id="login-error" class="error"></div>
+
+      <button id="btn-ingresar" class="btn-primary" onclick="handleLogin()">Ingresar</button>
+
+      <button id="btn-sync" class="btn-sync" onclick="sincronizarBaseDatos()">
+          🔄 Sincronizar Usuarios (Actualizar BD)
+      </button>
+    </div>
+
+    <div id="view-extension" class="card hidden">
+      <h2>Configuración Diaria</h2>
+      <p style="font-size:14px; color:#666;">Bienvenido, <span id="welcome-name"></span></p>
+      <p style="font-size:14px; margin-bottom:5px; text-align:left;">Confirma tu Filial:</p>
+      <select id="input-filial"><option value="">-- Seleccionar --</option></select>
+      <p style="font-size:14px; margin-bottom:5px; text-align:left;">Número de Extensión:</p>
+      <input type="number" id="input-extension" placeholder="Ej: 4005">
+      <button class="btn-primary" onclick="submitExtension()">Confirmar y Acceder</button>
+      <div id="ext-msg" class="error" style="color:#666;"></div>
+    </div>
+
+    <div id="view-dashboard" class="card hidden">
+      <h2>Control de Estatus</h2>
+      <div class="info-box">
+        <span id="dash-name">--</span>
+        Filial: <b id="dash-filial">--</b> | Ext: <b id="dash-ext">--</b><br>
+        Estado Actual: <b id="dash-status" style="font-size:16px;">---</b>
+        <div class="time-container">
+            <div id="status-since">Desde las: --:--</div>
+            <div id="status-chronometer">00:00:00</div>
+        </div>
+      </div>
+
+      <div id="menu-principal">
+        <button id="btn-principal-online" class="btn-main btn-online" onclick="cambiarEstado('ONLINE')">ONLINE</button>
+        <button class="btn-main btn-pausa" onclick="mostrarMenuPausas()">PAUSA</button>
+
+        <button id="btn-ir-monitor" class="btn-monitor-link hidden" onclick="irAlMonitor()">
+          IR AL MONITOR
+        </button>
+      </div>
+
+      <div id="menu-pausas" class="hidden">
+        <p style="margin:0 0 10px 0; color:#c62828; font-weight:bold; font-size:14px;">Motivo:</p>
+        <button class="btn-sub-pausa" onclick="cambiarEstado('Descanso')">Descanso</button>
+        <button class="btn-sub-pausa" onclick="cambiarEstado('Baño')">Baño</button>
+        <button class="btn-sub-pausa" onclick="cambiarEstado('Agua')">Agua</button>
+        <button class="btn-sub-pausa" onclick="cambiarEstado('Retro')">Retro</button>
+        <button class="btn-cancelar" onclick="ocultarMenuPausas()">Cancelar</button>
+      </div>
+
+      <button onclick="logout()" style="background:transparent; color:#999; font-size:12px; margin-top:20px; text-decoration:underline; border:none; cursor:pointer;">Cerrar Sesión (Logout)</button>
+      <div id="dash-msg" style="margin-top:10px; font-size:12px; color:#666;"></div>
+    </div>
+
+    <script>
+      const APP_URL = "<?!= url ?>";
+      let sessionData = {};
+      let userSesionActiva = false;
+      let intervaloCronometro;
+      let tiempoInicioEstado;
+      let sincronizacionRealizada = false;
+
+      window.addEventListener('beforeunload', function (e) {
+        if (userSesionActiva) { e.preventDefault(); e.returnValue = ''; }
+      });
+
+      document.addEventListener("DOMContentLoaded", function() {
+        document.getElementById("login-pass").addEventListener("keypress", function(e) {
+          if (e.key === "Enter") { e.preventDefault(); document.getElementById("btn-ingresar").click(); }
+        });
+        restaurarSesionLocal();
+      });
+
+      function restaurarSesionLocal() {
+        const stored = localStorage.getItem('sessionData');
+        const loader = document.getElementById('initial-loader');
+        if (stored) {
+           sessionData = JSON.parse(stored);
+           if (!sessionData.extension || !sessionData.filial) {
+              loader.style.display = 'none';
+              initViewExtension();
+           } else {
+              userSesionActiva = true;
+              actualizarUI_Dashboard();
+              loader.style.display = 'none';
+           }
+        } else {
+           loader.style.display = 'none';
+           document.getElementById('view-login').classList.remove('hidden');
+        }
+      }
+
+      function setLoading(isLoading, msg = "") {
+        const btns = document.querySelectorAll("button");
+        btns.forEach(b => {
+            if(b.id !== 'btn-sync') b.disabled = isLoading;
+        });
+        const dashMsg = document.getElementById('dash-msg');
+        if (dashMsg) dashMsg.innerText = isLoading ? (msg || "Procesando...") : "";
+        const btnLogin = document.getElementById('btn-ingresar');
+        if(btnLogin) btnLogin.innerText = isLoading ? "Cargando..." : "Ingresar";
+      }
+
+      function sincronizarBaseDatos() {
+        const btn = document.getElementById('btn-sync');
+        const originalText = btn.innerText;
+        const errDiv = document.getElementById('login-error');
+        btn.disabled = true;
+        btn.innerText = "Sincronizando...";
+        errDiv.innerText = "";
+        google.script.run
+          .withSuccessHandler(function(res) {
+             btn.disabled = false;
+             btn.innerText = originalText;
+             sincronizacionRealizada = true;
+             btn.style.display = 'none';
+             errDiv.style.color = "#2e7d32";
+             errDiv.innerText = "BD Actualizada. Por favor intente Ingresar nuevamente.";
+          })
+          .withFailureHandler(function(e) {
+             btn.disabled = false;
+             btn.innerText = originalText;
+             errDiv.style.color = "red";
+             errDiv.innerText = "Error al conectar con servidor.";
+          })
+          .forzarActualizacionCache();
+      }
+
+      function handleLogin() {
+        const u = document.getElementById('login-user').value;
+        const p = document.getElementById('login-pass').value;
+        const r = document.getElementById('login-role').value;
+        const errDiv = document.getElementById('login-error');
+        const btnSync = document.getElementById('btn-sync');
+        setLoading(true);
+        errDiv.innerText = "";
+        errDiv.style.color = "red";
+        const zonaCliente = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        google.script.run
+          .withSuccessHandler((res) => {
+              setLoading(false);
+              if (res.error) {
+                if (sincronizacionRealizada) {
+                    errDiv.innerHTML = res.msg + "<br><b>Contacte al Administrador.</b>";
+                    btnSync.style.display = 'none';
+                } else {
+                    errDiv.innerText = res.msg;
+                    btnSync.style.display = 'block';
+                }
+              } else {
+                sessionData = res;
+                localStorage.setItem('sessionData', JSON.stringify(sessionData));
+                initViewExtension();
+              }
+          })
+          .withFailureHandler(e => {
+              setLoading(false);
+              errDiv.innerText = "Error de conexión.";
+          })
+          .loginUsuario(u, p, r, zonaCliente);
+      }
+
+      function initViewExtension() {
+        document.getElementById('view-login').classList.add('hidden');
+        document.getElementById('view-extension').classList.remove('hidden');
+        document.getElementById('welcome-name').innerText = sessionData.nombres + " " + sessionData.apellidos;
+        document.getElementById('input-extension').value = sessionData.extension || "";
+        const sel = document.getElementById('input-filial');
+        sel.innerHTML = '<option value="">-- Seleccionar --</option>';
+        sessionData.listaFiliales.forEach(f => {
+          let opt = document.createElement("option");
+          opt.value = f; opt.text = f;
+          if(f === sessionData.filial) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      }
+
+      function submitExtension() {
+        const ext = document.getElementById('input-extension').value;
+        const fil = document.getElementById('input-filial').value;
+        const msg = document.getElementById('ext-msg');
+        if (!fil || !ext) { msg.innerText = "Completa todos los campos."; return; }
+        sessionData.extension = ext;
+        sessionData.filial = fil;
+        sessionData.estado = 'LOGIN';
+        sessionData.timestampStart = new Date().getTime();
+        localStorage.setItem('sessionData', JSON.stringify(sessionData));
+        msg.innerText = "Registrando entrada...";
+        setLoading(true);
+        const payload = armarPayload('LOGIN', null);
+        google.script.run
+          .withSuccessHandler(() => {
+              setLoading(false);
+              userSesionActiva = true;
+              actualizarUI_Dashboard();
+          })
+          .withFailureHandler(() => { setLoading(false); msg.innerText = "Error al conectar."; })
+          .registrarEvento(payload);
+      }
+
+      function actualizarUI_Dashboard() {
+        document.getElementById('view-extension').classList.add('hidden');
+        document.getElementById('view-dashboard').classList.remove('hidden');
+
+        document.getElementById('dash-name').innerText = sessionData.nombres;
+        document.getElementById('dash-ext').innerText = sessionData.extension;
+        document.getElementById('dash-filial').innerText = sessionData.filial;
+
+        const lblStatus = document.getElementById('dash-status');
+        const chrono = document.getElementById('status-chronometer');
+        const btnOnline = document.getElementById('btn-principal-online');
+
+        lblStatus.innerText = sessionData.estado;
+
+        // --- NUEVA LÓGICA DE BOTÓN ONLINE ---
+        if (sessionData.estado === 'ONLINE') {
+            lblStatus.style.color = '#2e7d32';
+            chrono.style.color = '#37474f';
+
+            // Caso ONLINE: Deshabilitado, Sin parpadeo, texto simple
+            btnOnline.disabled = true;
+            btnOnline.innerText = "ONLINE";
+            btnOnline.classList.remove('btn-confirm-blink');
+        }
+        else if (sessionData.estado === 'LOGIN') {
+             lblStatus.style.color = '#546e7a';
+             chrono.style.color = '#546e7a';
+
+             // Caso LOGIN: Habilitado para confirmar, Con parpadeo, Texto de invitación
+             btnOnline.disabled = false;
+             btnOnline.innerText = "HAZ CLIC PARA CONFIRMAR TÚ CONEXIÓN";
+             btnOnline.classList.add('btn-confirm-blink');
+        }
+        else {
+            // Caso PAUSAS: Habilitado, Sin parpadeo, Texto normal
+            btnOnline.disabled = false;
+            btnOnline.innerText = "ONLINE";
+            btnOnline.classList.remove('btn-confirm-blink');
+            lblStatus.style.color = '#c62828';
+            chrono.style.color = '#c62828';
+        }
+
+        const rolMayus = sessionData.rol ? sessionData.rol.toUpperCase() : "";
+        if (rolMayus === "TORRE DE CONTROL") {
+            document.getElementById('btn-ir-monitor').classList.remove('hidden');
+        }
+        iniciarRelojes();
+      }
+
+      function logout() {
+          if (!confirm("¿Cerrar sesión y terminar turno?")) return;
+          localStorage.removeItem('sessionData');
+          const duracionFinal = obtenerDuracionYParar();
+          userSesionActiva = false;
+          setLoading(true, "Cerrando sesión...");
+          const payload = armarPayload('DESCONECTADO', duracionFinal);
+          google.script.run
+              .withSuccessHandler(() => { window.top.location.href = APP_URL; })
+              .withFailureHandler(() => { window.top.location.href = APP_URL; })
+              .registrarEvento(payload);
+      }
+
+      function irAlMonitor() { window.open(APP_URL + "?v=Monitor", '_blank'); }
+
+      function cambiarEstado(nuevoEstado) {
+        if (sessionData.estado === nuevoEstado) return;
+
+        const duracionEstadoAnterior = obtenerDuracionYParar();
+        setLoading(true);
+        const payload = armarPayload(nuevoEstado, duracionEstadoAnterior);
+
+        google.script.run
+          .withSuccessHandler((res) => {
+              setLoading(false);
+              sessionData.estado = res.estado;
+              sessionData.timestampStart = new Date().getTime();
+              localStorage.setItem('sessionData', JSON.stringify(sessionData));
+              if(['Baño','Agua','Descanso', 'Retro'].includes(nuevoEstado)) ocultarMenuPausas();
+              actualizarUI_Dashboard();
+          })
+          .registrarEvento(payload);
+      }
+
+      function armarPayload(est, duracion) {
+        const zonaDetectada = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        return {
+          usuario: sessionData.usuario,
+          nombres: sessionData.nombres,
+          apellidos: sessionData.apellidos,
+          filial: sessionData.filial,
+          extension: sessionData.extension,
+          estado: est,
+          zonaHoraria: zonaDetectada,
+          duracion: duracion || "",
+          rol: sessionData.rol
+        };
+      }
+
+      let intervaloLatido;
+
+      function iniciarRelojes() {
+        if (sessionData.timestampStart) {
+              tiempoInicioEstado = new Date(sessionData.timestampStart);
+        } else {
+              tiempoInicioEstado = new Date();
+              sessionData.timestampStart = tiempoInicioEstado.getTime();
+              localStorage.setItem('sessionData', JSON.stringify(sessionData));
+        }
+        const horaTexto = tiempoInicioEstado.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        document.getElementById("status-since").innerText = "Desde las: " + horaTexto;
+        if (intervaloCronometro) clearInterval(intervaloCronometro);
+        intervaloCronometro = setInterval(actualizarCronometro, 1000);
+        actualizarCronometro();
+        if (!intervaloLatido) {
+            enviarLatidoServer();
+            intervaloLatido = setInterval(enviarLatidoServer, 300000);
+        }
+      }
+
+      function enviarLatidoServer() {
+         if (!sessionData || !sessionData.usuario) return;
+         google.script.run.enviarLatido(sessionData.usuario);
+      }
+
+      function actualizarCronometro() {
+        const ahora = new Date();
+        const diferencia = ahora - tiempoInicioEstado;
+        if(diferencia < 0) return;
+        const horas = Math.floor((diferencia % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const minutos = Math.floor((diferencia % (1000 * 60 * 60)) / (1000 * 60));
+        const segundos = Math.floor((diferencia % (1000 * 60)) / 1000);
+        const strH = (horas < 10) ? "0" + horas : horas;
+        const strM = (minutos < 10) ? "0" + minutos : minutos;
+        const strS = (segundos < 10) ? "0" + segundos : segundos;
+        document.getElementById("status-chronometer").innerText = strH + ":" + strM + ":" + strS;
+      }
+
+      function obtenerDuracionYParar() {
+        if (intervaloCronometro) clearInterval(intervaloCronometro);
+        if (intervaloLatido) { clearInterval(intervaloLatido); intervaloLatido = null; }
+        if (!tiempoInicioEstado) return "00:00:00";
+        const ahora = new Date();
+        const diferencia = ahora - tiempoInicioEstado;
+        const horas = Math.floor((diferencia % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const minutos = Math.floor((diferencia % (1000 * 60 * 60)) / (1000 * 60));
+        const segundos = Math.floor((diferencia % (1000 * 60)) / 1000);
+        return (horas < 10 ? "0"+horas : horas) + ":" + (minutos < 10 ? "0"+minutos : minutos) + ":" + (segundos < 10 ? "0"+segundos : segundos);
+      }
+
+      function mostrarMenuPausas() { document.getElementById('menu-principal').classList.add('hidden'); document.getElementById('menu-pausas').classList.remove('hidden'); }
+      function ocultarMenuPausas() { document.getElementById('menu-pausas').classList.add('hidden'); document.getElementById('menu-principal').classList.remove('hidden'); }
+    </script>
+  </body>
+</html>
+
+Vista #2: Monitor.html
+
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <style>
+    /* --- VARIABLES DE COLORES (TEMAS) --- */
+    :root {
+      --bg-body: #eceff1;
+      --bg-card: #ffffff;
+      --text-main: #37474f;
+      --text-muted: #546e7a;
+      --border-color: #eceff1;
+      --header-bg: #f5f7f8;
+      --input-bg: #ffffff;
+      --scroll-track: #f1f1f1;
+      --scroll-thumb: #c1c1c1;
+    }
+
+    /* CLASE PARA MODO OSCURO */
+    .dark-mode {
+      --bg-body: #121212;
+      --bg-card: #1e1e1e;
+      --text-main: #e0e0e0;
+      --text-muted: #b0bec5;
+      --border-color: #333333;
+      --header-bg: #2c2c2c;
+      --input-bg: #2c2c2c;
+      --scroll-track: #1e1e1e;
+      --scroll-thumb: #555;
+    }
+
+    /* ESTRUCTURA */
+    html, body { height: 100%; margin: 0; overflow: hidden; }
+
+    body {
+      font-family: 'Roboto', sans-serif;
+      background-color: var(--bg-body);
+      color: var(--text-main);
+      padding: 20px;
+      box-sizing: border-box;
+      display: flex; flex-direction: column;
+      transition: background-color 0.3s, color 0.3s;
+    }
+
+    /* HEADER */
+    .header {
+      display: flex; flex-wrap: wrap;
+      justify-content: space-between; align-items: flex-start;
+      margin-bottom: 15px;
+      background: var(--bg-card);
+      padding: 15px 20px;
+      border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+      gap: 15px; flex-shrink: 0;
+    }
+
+    .header-left h2 { color: var(--text-main); margin: 0; font-size: 20px; }
+
+    .stats-row { display: flex; gap: 10px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+    .stat-badge {
+      font-size: 11px; font-weight: bold; color: var(--text-muted);
+      display: flex; align-items: center; gap: 6px;
+      background: var(--header-bg);
+      padding: 4px 10px; border-radius: 12px; border: 1px solid var(--border-color);
+      white-space: nowrap; /* Evita que el texto se rompa dentro del badge */
+    }
+    .stat-num { font-size: 13px; font-weight: 900; }
+
+    /* Colores para contadores */
+    .c-blue { color: #0277bd; }
+    .c-green { color: #2e7d32; }
+    .c-red { color: #c62828; }
+    .c-purple { color: #7b1fa2; } /* Nuevo color para Login */
+
+    /* CONTROLES (Botonera derecha) */
+    .header-right { display: flex; align-items: center; gap: 15px; margin-top: 5px; flex-wrap: wrap; justify-content: flex-end;}
+
+    .control-panel {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end;
+    }
+
+    .user-info { text-align: right; font-size: 12px; color: var(--text-muted); line-height: 1.2; margin-right: 5px; }
+    .user-name { font-weight: bold; display: block; color: var(--text-main); }
+
+    .btn-mini { border: none; padding: 8px 12px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 11px; transition: 0.2s; white-space: nowrap; }
+    .btn-green { background-color: #43a047; color: white; }
+    .btn-green:hover { background-color: #2e7d32; }
+    .btn-gray { background-color: #cfd8dc; color: #455a64; }
+    .btn-gray:hover { background-color: #b0bec5; }
+    .btn-blue { background-color: #0288d1; color: white; }
+    .btn-blue:hover { background-color: #0277bd; }
+
+    /* Botón Modo Oscuro */
+    .btn-theme { background: transparent; border: 1px solid var(--text-muted); color: var(--text-muted); font-size: 14px; padding: 6px 10px; border-radius: 4px; cursor: pointer; }
+    .btn-theme:hover { background: var(--header-bg); }
+
+    select.sel-mini { padding: 6px; border-radius: 4px; border: 1px solid var(--text-muted); font-size: 11px; background: var(--bg-card); font-weight: bold; color: var(--text-muted); cursor: pointer;}
+
+    /* FILTROS */
+    .filter-bar { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; flex-shrink: 0; flex-wrap: wrap; }
+    .filter-input, .filter-select {
+      padding: 8px; border-radius: 4px; border: 1px solid var(--border-color);
+      background: var(--input-bg); color: var(--text-main); font-size: 12px;
+    }
+    .filter-input { min-width: 200px; }
+    .filter-select { min-width: 150px; }
+
+    /* TABLA Y CARD */
+    .card {
+      background: var(--bg-card);
+      border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+      flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0;
+    }
+
+    .table-responsive {
+      width: 100%; overflow: auto; flex: 1;
+      scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+    }
+    .table-responsive::-webkit-scrollbar { width: 8px; height: 8px; }
+    .table-responsive::-webkit-scrollbar-track { background: var(--scroll-track); }
+    .table-responsive::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 4px; }
+
+    table { width: 100%; border-collapse: collapse; min-width: 600px; }
+    th, td { padding: 15px; text-align: left; border-bottom: 1px solid var(--border-color); }
+
+    th {
+      background-color: var(--header-bg);
+      color: var(--text-muted);
+      font-weight: 600; font-size: 14px; text-transform: uppercase; white-space: nowrap;
+      position: sticky; top: 0; z-index: 10;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+    }
+
+    /* Badges de Tabla */
+    .status-badge { padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; text-transform: uppercase; display: inline-block; width: 80px; text-align: center; }
+    .st-online { background-color: rgba(46, 125, 50, 0.2); color: #2e7d32; }
+    .st-pausa { background-color: rgba(198, 40, 40, 0.2); color: #c62828; }
+    .st-login { background-color: var(--header-bg); color: var(--text-muted); border: 1px solid var(--border-color); }
+    .dark-mode .st-online { color: #66bb6a; }
+    .dark-mode .st-pausa { color: #ef5350; }
+
+    .role-badge { font-size: 11px; font-weight: bold; color: #fff; background-color: #78909c; padding: 4px 8px; border-radius: 4px; text-transform: uppercase; }
+
+    /* Timer Semaforo */
+    .timer { font-family: 'Roboto Mono', monospace; font-weight: 700; font-size: 15px; }
+    .t-green { color: #2e7d32; }
+    .t-orange { color: #f57f17; }
+    .t-red { color: #c62828; }
+
+    .dark-mode .t-green { color: #66bb6a; }
+    .dark-mode .t-orange { color: #ffa726; }
+    .dark-mode .t-red { color: #ef5350; }
+
+    .live-indicator { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #2e7d32; font-weight: bold; margin-left: 10px;}
+    .dark-mode .live-indicator { color: #66bb6a; }
+
+    .dot { height: 8px; width: 8px; background-color: #43a047; border-radius: 50%; display: inline-block; animation: pulse 2s infinite; }
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+    .loading { text-align: center; padding: 20px; color: var(--text-muted); }
+    .processing { opacity: 0.5; pointer-events: none; }
+
+    @media (max-width: 768px) {
+      .header { flex-direction: column; align-items: stretch; }
+      .header-right { justify-content: space-between; margin-top: 15px;}
+      .filter-bar { flex-direction: column; align-items: stretch; }
+      .filter-input { width: 100%; min-width: auto; }
+      th, td { padding: 10px; font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="header-left">
+      <div style="display:flex; align-items:center;">
+        <h2>Torre de Control</h2>
+        <div class="live-indicator">
+          <span class="dot"></span> EN VIVO
+        </div>
+      </div>
+
+      <div class="stats-row">
+         <div class="stat-badge" title="Total en vista"><span class="stat-num c-blue" id="st-total">0</span> Conectados</div>
+         <div class="stat-badge"><span class="stat-num c-green" id="st-online">0</span> Online</div>
+         <div class="stat-badge"><span class="stat-num c-red" id="st-pausa">0</span> Pausa</div>
+         <div class="stat-badge"><span class="stat-num c-purple" id="st-login">0</span> Login</div>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <button class="btn-theme" onclick="toggleDarkMode()" title="Cambiar Tema">🌙/☀️</button>
+
+      <div id="my-controls" class="control-panel" style="display:none;">
+        <div class="user-info">
+           <span class="user-name" id="lbl-nombre">Usuario</span>
+           <span id="lbl-status">Estado: --</span>
+        </div>
+
+        <button onclick="cambiarMiEstado('ONLINE')" class="btn-mini btn-green">ONLINE</button>
+
+        <select class="sel-mini" onchange="if(this.value){ cambiarMiEstado(this.value); this.value=''; }">
+           <option value="">PAUSA...</option>
+           <option value="Baño">Baño</option>
+           <option value="Agua">Agua</option>
+           <option value="Descanso">Descanso</option>
+           <option value="Retro">Retro</option>
+        </select>
+
+        <button onclick="sincronizarBaseDatos()" class="btn-mini btn-blue">🔄 SYNC</button>
+        <button onclick="logoutLocal()" class="btn-mini btn-gray">SALIR</button>
+      </div>
+
+      <div id="no-session-msg" style="font-size:12px; color:var(--text-muted); display:none;">
+        Modo Lectura
+      </div>
+    </div>
+  </div>
+
+  <div class="filter-bar">
+    <input type="text" id="filtro-nombre" class="filter-input" placeholder="🔍 Buscar por nombre..." onkeyup="renderizarTabla()">
+    <select id="filtro-filial" class="filter-select" onchange="renderizarTabla()">
+      <option value="">🏢 Todas las Filiales</option>
+    </select>
+    <select id="filtro-rol" class="filter-select" onchange="renderizarTabla()">
+      <option value="">👤 Todos los Roles</option>
+    </select>
+  </div>
+
+  <div class="card">
+    <div id="loading-msg" class="loading">Cargando datos...</div>
+
+    <div class="table-responsive">
+      <table id="tabla-monitor" style="display:none;">
+        <thead>
+          <tr>
+            <th>Filial</th>
+            <th>Rol</th>
+            <th>Nombre</th>
+            <th>Extensión</th>
+            <th>Estado Actual</th>
+            <th>Tiempo</th>
+          </tr>
+        </thead>
+        <tbody id="tabla-body">
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    let datosUsuarios = [];
+    let miSession = null;
+    const APP_URL = "<?!= url ?>";
+
+    document.addEventListener("DOMContentLoaded", function() {
+       if(localStorage.getItem('theme') === 'dark') {
+         document.body.classList.add('dark-mode');
+       }
+       recuperarSesion();
+       cicloCargaDatos();
+       setInterval(actualizarCronometrosVisuales, 1000);
+    });
+
+    function toggleDarkMode() {
+       document.body.classList.toggle('dark-mode');
+       const theme = document.body.classList.contains('dark-mode') ? 'dark' : 'light';
+       localStorage.setItem('theme', theme);
+    }
+
+    function sincronizarBaseDatos() {
+      const btn = event.target;
+      const textoOriginal = btn.innerText;
+      btn.disabled = true;
+      btn.innerText = "...";
+
+      google.script.run
+        .withSuccessHandler(function(res) {
+           btn.disabled = false;
+           btn.innerText = textoOriginal;
+           alert("✅ " + res.msg);
+           cicloCargaDatos();
+        })
+        .withFailureHandler(function(e) {
+           btn.disabled = false;
+           btn.innerText = textoOriginal;
+           alert("Error: " + e);
+        })
+        .forzarActualizacionCache();
+    }
+
+    function recuperarSesion() {
+       const stored = localStorage.getItem('sessionData');
+       if (stored) {
+         miSession = JSON.parse(stored);
+         document.getElementById('my-controls').style.display = 'flex';
+         document.getElementById('lbl-nombre').innerText = miSession.nombres;
+         actualizarBadgeLocal(miSession.estado || "LOGIN");
+       } else {
+         document.getElementById('no-session-msg').style.display = 'block';
+       }
+    }
+
+    function cambiarMiEstado(nuevoEstado) {
+       if (!miSession) return;
+       const panel = document.getElementById('my-controls');
+       panel.classList.add('processing');
+
+       const payload = {
+         usuario: miSession.usuario,
+         nombres: miSession.nombres,
+         apellidos: miSession.apellidos,
+         filial: miSession.filial,
+         extension: miSession.extension,
+         estado: nuevoEstado,
+         rol: miSession.rol,
+         zonaHoraria: Intl.DateTimeFormat().resolvedOptions().timeZone,
+         duracion: ""
+       };
+
+       google.script.run
+         .withSuccessHandler((res) => {
+           panel.classList.remove('processing');
+           miSession.estado = res.estado;
+           localStorage.setItem('sessionData', JSON.stringify(miSession));
+           actualizarBadgeLocal(res.estado);
+           setTimeout(cicloCargaDatos, 500);
+         })
+         .registrarEvento(payload);
+    }
+
+    function actualizarBadgeLocal(estado) {
+       const lbl = document.getElementById('lbl-status');
+       lbl.innerText = "Estado: " + estado;
+       if(estado === 'ONLINE') lbl.style.color = '#2e7d32';
+       else if(['Baño','Agua','Descanso','Retro'].includes(estado)) lbl.style.color = '#c62828';
+       else lbl.style.color = '#546e7a';
+    }
+
+    function logoutLocal() {
+       if(!confirm("¿Cerrar sesión?")) return;
+       localStorage.removeItem('sessionData');
+       if(miSession) {
+         const payload = { ...miSession, estado: 'DESCONECTADO' };
+         google.script.run.registrarEvento(payload);
+       }
+       window.top.location.href = APP_URL;
+    }
+
+    function cicloCargaDatos() {
+      google.script.run
+        .withSuccessHandler((res) => {
+           datosUsuarios = res;
+           renderizarTabla();
+           document.getElementById('loading-msg').style.display = 'none';
+           document.getElementById('tabla-monitor').style.display = 'table';
+           setTimeout(cicloCargaDatos, 5000);
+        })
+        .withFailureHandler((e) => {
+           console.error("Error cargando monitor:", e);
+           setTimeout(cicloCargaDatos, 10000);
+        })
+        .obtenerDashboardSupervisor();
+    }
+
+    function actualizarOpcionesFiltros() {
+      const selFilial = document.getElementById('filtro-filial');
+      const selRol = document.getElementById('filtro-rol');
+
+      const filiales = [...new Set(datosUsuarios.map(u => u.filial))].sort();
+      const roles = [...new Set(datosUsuarios.map(u => u.rol))].sort();
+
+      if (selFilial.options.length <= 1 && filiales.length > 0) {
+        filiales.forEach(f => {
+           const opt = document.createElement('option');
+           opt.value = f; opt.innerText = f;
+           selFilial.appendChild(opt);
+        });
+      }
+      if (selRol.options.length <= 1 && roles.length > 0) {
+        roles.forEach(r => {
+           const opt = document.createElement('option');
+           opt.value = r; opt.innerText = r;
+           selRol.appendChild(opt);
+        });
+      }
+    }
+
+    function renderizarTabla() {
+      const tbody = document.getElementById('tabla-body');
+      actualizarOpcionesFiltros();
+
+      const filtroFilialVal = document.getElementById('filtro-filial').value;
+      const filtroRolVal = document.getElementById('filtro-rol').value;
+      const filtroNombreVal = document.getElementById('filtro-nombre').value.toLowerCase().trim();
+
+      // 1. PRIMERO FILTRAMOS LA LISTA
+      let listaFiltrada = datosUsuarios.filter(u => {
+        const matchFilial = filtroFilialVal === "" || u.filial === filtroFilialVal;
+        const matchRol = filtroRolVal === "" || u.rol === filtroRolVal;
+        const matchNombre = u.nombre.toLowerCase().includes(filtroNombreVal);
+        return matchFilial && matchRol && matchNombre;
+      });
+
+      // 2. CAMBIO CRÍTICO: CALCULAMOS CONTADORES USANDO LA LISTA YA FILTRADA
+      // Esto hace que el conteo responda al filtro de roles y actualizaciones.
+      let totalConectados = listaFiltrada.length;
+      let countOnline = listaFiltrada.filter(u => u.estado === 'ONLINE').length;
+      let countLogin = listaFiltrada.filter(u => u.estado === 'LOGIN').length;
+      // Asumimos que "Pausa" es todo lo que no es Online ni Login (Baño, Retro, etc.)
+      let countPausa = totalConectados - countOnline - countLogin;
+
+      // Actualizamos los Badges Superiores con los datos filtrados
+      document.getElementById('st-total').innerText = totalConectados;
+      document.getElementById('st-online').innerText = countOnline;
+      document.getElementById('st-pausa').innerText = countPausa;
+      document.getElementById('st-login').innerText = countLogin;
+
+
+      // 3. ORDENAMIENTO (Igual que antes: Pausas arriba, Tiempos largos arriba)
+      listaFiltrada.sort((a, b) => {
+        const aPausa = (a.estado !== 'ONLINE');
+        const bPausa = (b.estado !== 'ONLINE');
+
+        if (aPausa && !bPausa) return -1;
+        if (!aPausa && bPausa) return 1;
+
+        return a.timestamp - b.timestamp;
+      });
+
+      if (listaFiltrada.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:20px;">No hay datos que coincidan.</td></tr>';
+      } else {
+        let htmlContent = "";
+        listaFiltrada.forEach(u => {
+          let claseEstado = 'st-pausa'; // Default rojo
+          if (u.estado === 'ONLINE') claseEstado = 'st-online';
+          else if (u.estado === 'LOGIN') claseEstado = 'st-login';
+
+          htmlContent += `
+            <tr>
+              <td>${u.filial}</td>
+              <td><span class="role-badge">${u.rol}</span></td>
+              <td style="font-weight:500;">${u.nombre}</td>
+              <td>${u.extension}</td>
+              <td><span class="status-badge ${claseEstado}">${u.estado}</span></td>
+              <td>
+                 <span class="timer" data-start="${u.timestamp}" data-status="${u.estado}">...</span>
+              </td>
+            </tr>
+          `;
+        });
+        tbody.innerHTML = htmlContent;
+      }
+
+      actualizarCronometrosVisuales();
+    }
+
+    // SEMÁFORO DE COLORES EN RELOJ
+    function actualizarCronometrosVisuales() {
+      const timers = document.querySelectorAll('.timer');
+      const ahora = new Date().getTime();
+
+      timers.forEach(span => {
+        const inicio = parseInt(span.getAttribute('data-start'));
+        const status = span.getAttribute('data-status');
+
+        if (!inicio) return;
+
+        const diff = ahora - inicio;
+        if (diff < 0) { span.innerText = "00:00:00"; return; }
+
+        const horas = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const minutos = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+        const segundos = Math.floor((diff % (1000 * 60)) / 1000);
+
+        const strH = (horas < 10) ? "0" + horas : horas;
+        const strM = (minutos < 10) ? "0" + minutos : minutos;
+        const strS = (segundos < 10) ? "0" + segundos : segundos;
+
+        span.innerText = strH + ":" + strM + ":" + strS;
+
+        span.classList.remove('t-green', 't-orange', 't-red');
+
+        if (status === 'ONLINE') {
+             span.classList.add('t-green');
+        } else if (status === 'LOGIN') {
+             // Login no suele tener semáforo crítico, lo dejamos neutral o verde
+             span.classList.add('t-green');
+        } else {
+             const totalMinutos = (horas * 60) + minutos;
+             if (totalMinutos < 5) {
+                 span.classList.add('t-green');
+             } else if (totalMinutos >= 5 && totalMinutos < 15) {
+                 span.classList.add('t-orange');
+             } else {
+                 span.classList.add('t-red');
+             }
+        }
+      });
+    }
+  </script>
+</body>
+</html>
